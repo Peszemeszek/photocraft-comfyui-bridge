@@ -1,0 +1,110 @@
+"""python -m pccomfy [gui|check|run] …"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+from . import config as cfgmod
+from .bridge import MODES, Bridge, BridgeError, Request
+from .comfy import ComfyError, ComfyUI
+from .photocraft import PhotoCraft, PhotoCraftError
+from .workflows import GenParams
+
+
+def make(cfg: dict) -> Bridge:
+    pcc, cc = cfg["photocraft"], cfg["comfyui"]
+    pc = PhotoCraft(pcc["host"], int(pcc["port"]), token_file=pcc["token_file"], headless=bool(pcc["headless"]))
+    return Bridge(pc, ComfyUI(cc["url"]), pcc["exchange_dir"])
+
+
+def cmd_check(cfg: dict) -> int:
+    b = make(cfg)
+    ok = True
+    try:
+        info = b.pc.ping()
+        print(f"PhotoCraft: OK – open documents: {info['documents']}, active: {info['active']}")
+    except PhotoCraftError as e:
+        ok = False
+        print(f"PhotoCraft: ERROR – {e}")
+    try:
+        stats = b.comfy.system_stats()
+        dev = (stats.get("devices") or [{}])[0]
+        print(f"ComfyUI: OK – {stats.get('system', {}).get('comfyui_version', '?')}, {dev.get('name', '?')}")
+        ckpts = b.comfy.checkpoints()
+        print(f"  checkpoints ({len(ckpts)}):", *ckpts[:30], sep="\n    ")
+        fo = b.comfy.fooocus_inpaint()
+        print("  Fooocus inpaint:", f"OK ({fo[0]}, {fo[1]})" if fo else "not found (needs comfyui-inpaint-nodes and the files in models/inpaint)")
+    except ComfyError as e:
+        ok = False
+        print(f"ComfyUI: ERROR – {e}")
+    return 0 if ok else 1
+
+
+def cmd_run(cfg: dict, a) -> int:
+    d = cfg["defaults"]
+    p = GenParams(prompt=a.prompt, negative=a.negative if a.negative is not None else d["negative"],
+                  checkpoint=a.checkpoint or d["checkpoint"], steps=a.steps or d["steps"],
+                  cfg=a.cfg or d["cfg"], sampler=d["sampler"], scheduler=d["scheduler"], seed=a.seed,
+                  denoise=a.denoise if a.denoise is not None else (1.0 if a.mode in ("inpaint", "outpaint") else d["denoise"]))
+    req = Request(mode=a.mode, params=p, workflow=a.workflow, base_res=a.res or d["base_res"],
+                  context=d["context"], mask_grow=d["mask_grow"], mask_blur=d["mask_blur"],
+                  outpaint=tuple(a.expand), overlap=d["overlap"], variants=a.variants, fooocus=not a.no_fooocus,
+                  layer_mask=a.layer_mask)
+    b = make(cfg)
+    if not p.checkpoint and not a.workflow:
+        try:
+            p.checkpoint = (b.comfy.checkpoints() or [""])[0]
+        except ComfyError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    def progress(f, msg):
+        pct = "   " if f < 0 else f"{int(f * 100):3d}%"
+        print(f"\r{pct} {msg:<50}", end="", flush=True)
+
+    try:
+        res = b.run(req, progress)
+    except (BridgeError, ComfyError, ValueError) as e:
+        print(f"\nError: {e}", file=sys.stderr)
+        return 1
+    print("\n" + json.dumps(res, ensure_ascii=False))
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="pccomfy", description="PhotoCraft ↔ ComfyUI bridge")
+    ap.add_argument("--config", help="path to config.toml")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("gui", help="bridge window (default)")
+    sub.add_parser("check", help="check connections and list models")
+    r = sub.add_parser("run", help="one generation from the command line")
+    r.add_argument("mode", choices=MODES)
+    r.add_argument("-p", "--prompt", default="")
+    r.add_argument("-n", "--negative")
+    r.add_argument("-m", "--checkpoint")
+    r.add_argument("-w", "--workflow", help="custom workflow (API-format JSON)")
+    r.add_argument("--steps", type=int)
+    r.add_argument("--cfg", type=float)
+    r.add_argument("--denoise", type=float)
+    r.add_argument("--seed", type=int, default=-1)
+    r.add_argument("--res", type=int, help="base resolution (e.g. 512, 768, 1024)")
+    r.add_argument("--variants", type=int, default=1)
+    r.add_argument("--layer-mask", choices=("soft", "selection", "none"), default="soft",
+                   help="layer mask of the new layer: soft (default), hard from the selection, or none")
+    r.add_argument("--no-fooocus", action="store_true", help="don't use the Fooocus patch (e.g. for SD1.5 models)")
+    r.add_argument("--expand", type=int, nargs=4, default=[0, 0, 0, 0], metavar=("L", "T", "R", "B"),
+                   help="outpaint: pixels to add on the left/top/right/bottom")
+    a = ap.parse_args(argv)
+    cfg = cfgmod.load(a.config)
+    if a.cmd == "check":
+        return cmd_check(cfg)
+    if a.cmd == "run":
+        return cmd_run(cfg, a)
+    from .gui import run_gui
+    return run_gui(cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

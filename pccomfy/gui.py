@@ -1,0 +1,381 @@
+"""Small bridge window (tkinter). Sits next to PhotoCraft: select in PhotoCraft, type the prompt here."""
+
+from __future__ import annotations
+
+import queue
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import ttk
+
+from . import config as cfgmod
+from .bridge import Bridge, BridgeError, Request
+from .comfy import Cancelled, ComfyError, ComfyUI
+from .photocraft import PhotoCraft, PhotoCraftError
+from .workflows import GenParams, list_templates
+
+MODE_LABELS = [
+    ("inpaint", "Generative fill"),
+    ("outpaint", "Expand image"),
+    ("img2img", "Image → image"),
+    ("txt2img", "Text → image"),
+]
+BUILTIN = "Built-in (checkpoint)"
+LAYER_MASKS = {"soft": "soft (same as the model's)", "selection": "hard (from selection)", "none": "none"}
+
+BG, PANEL, FG, MUTED, ACCENT = "#16181d", "#1f2229", "#e6e8ee", "#8a90a0", "#7c5cff"
+
+
+class App:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.state = cfgmod.load_state()
+        d = cfg["defaults"]
+        pcc, cc = cfg["photocraft"], cfg["comfyui"]
+        self.pc = PhotoCraft(pcc["host"], int(pcc["port"]), token_file=pcc["token_file"], headless=bool(pcc["headless"]))
+        self.comfy = ComfyUI(cc["url"])
+        self.bridge = Bridge(self.pc, self.comfy, pcc["exchange_dir"])
+        self.workflows_dir = Path(cc["workflows_dir"]).expanduser()
+        self.events: queue.Queue = queue.Queue()
+        self.worker: threading.Thread | None = None
+
+        self.root = tk.Tk()
+        self.root.title("PhotoCraft × ComfyUI")
+        self.root.configure(bg=BG)
+        self.root.minsize(420, 560)
+        self._style()
+
+        g = lambda k, default: self.state.get(k, default)  # noqa: E731
+        self.v_mode = tk.StringVar(value=g("mode", "inpaint"))
+        self.v_workflow = tk.StringVar(value=g("workflow", BUILTIN))
+        self.v_ckpt = tk.StringVar(value=g("checkpoint", d["checkpoint"]))
+        self.v_steps = tk.IntVar(value=g("steps", d["steps"]))
+        self.v_cfg = tk.DoubleVar(value=g("cfg", d["cfg"]))
+        self.v_denoise = tk.DoubleVar(value=g("denoise", d["denoise"]))
+        self.v_seed = tk.IntVar(value=-1)
+        self.v_variants = tk.IntVar(value=g("variants", d["variants"]))
+        self.v_sampler = tk.StringVar(value=g("sampler", d["sampler"]))
+        self.v_scheduler = tk.StringVar(value=g("scheduler", d["scheduler"]))
+        self.v_res = tk.IntVar(value=g("base_res", d["base_res"]))
+        self.v_context = tk.DoubleVar(value=g("context", d["context"]))
+        self.v_grow = tk.IntVar(value=g("mask_grow", d["mask_grow"]))
+        self.v_blur = tk.IntVar(value=g("mask_blur", d["mask_blur"]))
+        self.v_overlap = tk.IntVar(value=g("overlap", d["overlap"]))
+        self.v_expand = [tk.IntVar(value=v) for v in g("expand", [0, 0, 256, 0])]
+        self.v_top = tk.BooleanVar(value=g("on_top", True))
+        self.v_fooocus = tk.BooleanVar(value=g("fooocus", True))
+        self.v_lmask = tk.StringVar(value=LAYER_MASKS.get(g("layer_mask", "soft"), LAYER_MASKS["soft"]))
+        self.v_status = tk.StringVar(value="Ready")
+        self.v_conn = tk.StringVar(value="")
+
+        self._build(d)
+        self._on_mode()
+        self._on_top()
+        self.root.after(100, self._poll)
+        self.root.after(200, self.refresh)
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
+
+    # ---------- UI ----------
+
+    def _style(self):
+        s = ttk.Style(self.root)
+        s.theme_use("clam")
+        s.configure(".", background=BG, foreground=FG, fieldbackground=PANEL, bordercolor="#2c303a",
+                    lightcolor=PANEL, darkcolor=PANEL, troughcolor=PANEL, focuscolor=ACCENT, font=("Sans", 10))
+        s.configure("TLabel", background=BG, foreground=FG)
+        s.configure("Muted.TLabel", foreground=MUTED, font=("Sans", 9))
+        s.configure("TLabelframe", background=BG, bordercolor="#2c303a")
+        s.configure("TLabelframe.Label", background=BG, foreground=MUTED)
+        s.configure("TRadiobutton", background=BG, foreground=FG)
+        s.configure("TCheckbutton", background=BG, foreground=FG)
+        for w in ("TRadiobutton", "TCheckbutton"):
+            s.map(w, background=[("active", BG)], indicatorbackground=[("selected", ACCENT), ("active", "#2a2e38")],
+                  indicatorforeground=[("selected", "white")])
+        s.configure("TButton", background=PANEL, foreground=FG, padding=6)
+        s.map("TButton", background=[("active", "#2a2e38")])
+        s.configure("Accent.TButton", background=ACCENT, foreground="white", font=("Sans", 10, "bold"))
+        s.map("Accent.TButton", background=[("active", "#6a4cf0"), ("disabled", "#3a3550")])
+        s.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=FG, arrowcolor=FG)
+        s.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", FG)],
+              selectbackground=[("readonly", PANEL)], selectforeground=[("readonly", FG)])
+        s.configure("TCheckbutton", indicatorbackground=PANEL, indicatorforeground=FG)
+        s.configure("TRadiobutton", indicatorbackground=PANEL)
+        s.configure("TSpinbox", fieldbackground=PANEL, foreground=FG, arrowcolor=FG)
+        s.configure("Horizontal.TProgressbar", background=ACCENT)
+        self.root.option_add("*TCombobox*Listbox.background", PANEL)
+        self.root.option_add("*TCombobox*Listbox.foreground", FG)
+
+    def _text(self, parent, height):
+        t = tk.Text(parent, height=height, wrap="word", bg=PANEL, fg=FG, insertbackground=FG,
+                    relief="flat", highlightthickness=1, highlightbackground="#2c303a", highlightcolor=ACCENT,
+                    font=("Sans", 10), padx=6, pady=4)
+        return t
+
+    def _spin(self, parent, var, frm, to, inc=1.0, width=6):
+        return ttk.Spinbox(parent, textvariable=var, from_=frm, to=to, increment=inc, width=width)
+
+    def _build(self, d):
+        r = self.root
+        pad = {"padx": 10, "pady": 4}
+
+        modes = ttk.Frame(r)
+        modes.pack(fill="x", **pad)
+        for i, (key, label) in enumerate(MODE_LABELS):
+            ttk.Radiobutton(modes, text=label, value=key, variable=self.v_mode, command=self._on_mode).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 16), pady=1)
+
+        ttk.Label(r, text="Prompt").pack(anchor="w", padx=10)
+        self.t_prompt = self._text(r, 4)
+        self.t_prompt.pack(fill="x", padx=10)
+        self.t_prompt.insert("1.0", self.state.get("prompt", ""))
+        ttk.Label(r, text="Negative prompt").pack(anchor="w", padx=10, pady=(6, 0))
+        self.t_neg = self._text(r, 2)
+        self.t_neg.pack(fill="x", padx=10)
+        self.t_neg.insert("1.0", self.state.get("negative", d["negative"]))
+
+        mf = ttk.Frame(r)
+        mf.pack(fill="x", **pad)
+        mf.columnconfigure(1, weight=1)
+        ttk.Label(mf, text="Workflow").grid(row=0, column=0, sticky="w")
+        self.cb_workflow = ttk.Combobox(mf, textvariable=self.v_workflow, state="readonly")
+        self.cb_workflow.bind("<<ComboboxSelected>>", lambda e: self._on_workflow())
+        self.cb_workflow.grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(mf, text="Model").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.cb_ckpt = ttk.Combobox(mf, textvariable=self.v_ckpt)
+        self.cb_ckpt.grid(row=1, column=1, sticky="ew", padx=6, pady=(4, 0))
+
+        sf = ttk.Frame(r)
+        sf.pack(fill="x", **pad)
+        items = [("Steps", self._spin(sf, self.v_steps, 1, 150, 1, 5)),
+                 ("CFG", self._spin(sf, self.v_cfg, 1, 30, 0.5, 5)),
+                 ("Denoise", self._spin(sf, self.v_denoise, 0.05, 1.0, 0.05, 5)),
+                 ("Seed (-1 random)", self._spin(sf, self.v_seed, -1, 2**31 - 1, 1, 11)),
+                 ("Variants", self._spin(sf, self.v_variants, 1, 8, 1, 4))]
+        for i, (lbl, w) in enumerate(items):
+            ttk.Label(sf, text=lbl, style="Muted.TLabel").grid(row=0, column=i, sticky="w", padx=(0, 6))
+            w.grid(row=1, column=i, sticky="w", padx=(0, 6))
+        self.w_denoise = items[2][1]
+        self.recipe_widgets = [items[0][1], items[1][1]]
+
+        sm = ttk.Frame(r)
+        sm.pack(fill="x", **pad)
+        sm.columnconfigure((1, 3), weight=1)
+        ttk.Label(sm, text="Sampler", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        self.cb_sampler = ttk.Combobox(sm, textvariable=self.v_sampler, width=14)
+        self.cb_sampler.grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Label(sm, text="Scheduler", style="Muted.TLabel").grid(row=0, column=2, sticky="w")
+        self.cb_sched = ttk.Combobox(sm, textvariable=self.v_scheduler, width=12)
+        self.cb_sched.grid(row=0, column=3, sticky="ew", padx=6)
+        self.recipe_widgets += [self.cb_ckpt, self.cb_sampler, self.cb_sched]
+
+        self.f_out = ttk.LabelFrame(r, text="Expand by (px)")
+        for i, lbl in enumerate(("Left", "Top", "Right", "Bottom")):
+            ttk.Label(self.f_out, text=lbl, style="Muted.TLabel").grid(row=0, column=i, sticky="w", padx=6)
+            self._spin(self.f_out, self.v_expand[i], 0, 8192, 64, 6).grid(row=1, column=i, padx=6, pady=(0, 6))
+        ttk.Label(self.f_out, text="Overlap", style="Muted.TLabel").grid(row=0, column=4, sticky="w", padx=6)
+        self._spin(self.f_out, self.v_overlap, 0, 512, 8, 5).grid(row=1, column=4, padx=6, pady=(0, 6))
+
+        self.f_adv = ttk.LabelFrame(r, text="Advanced")
+        self.f_adv.pack(fill="x", **pad)
+        for i, (lbl, var, lo, hi, inc) in enumerate((("Base res.", self.v_res, 256, 2048, 64),
+                                                    ("Context", self.v_context, 0, 2, 0.1),
+                                                    ("Mask grow", self.v_grow, 0, 128, 2),
+                                                    ("Mask blur", self.v_blur, 0, 128, 2))):
+            ttk.Label(self.f_adv, text=lbl, style="Muted.TLabel").grid(row=0, column=i, sticky="w", padx=6)
+            self._spin(self.f_adv, var, lo, hi, inc, 6).grid(row=1, column=i, padx=6, pady=(0, 6))
+        self.cb_fooocus = ttk.Checkbutton(self.f_adv, text="Fooocus inpaint (SDXL, as in Krita AI Diffusion)", variable=self.v_fooocus)
+        self.cb_fooocus.grid(row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
+        lm = ttk.Frame(self.f_adv)
+        lm.grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
+        ttk.Label(lm, text="Layer mask", style="Muted.TLabel").pack(side="left")
+        ttk.Combobox(lm, textvariable=self.v_lmask, values=list(LAYER_MASKS.values()), state="readonly",
+                     width=24).pack(side="left", padx=6)
+
+        bf = ttk.Frame(r)
+        bf.pack(fill="x", padx=10, pady=(8, 2))
+        self.b_go = ttk.Button(bf, text="Generate  (Ctrl+Enter)", style="Accent.TButton", command=self.generate)
+        self.b_go.pack(side="left", fill="x", expand=True)
+        self.b_stop = ttk.Button(bf, text="Cancel", command=self.stop, state="disabled")
+        self.b_stop.pack(side="left", padx=(6, 0))
+
+        self.pb = ttk.Progressbar(r, mode="determinate", maximum=1.0)
+        self.pb.pack(fill="x", padx=10, pady=(6, 0))
+        ttk.Label(r, textvariable=self.v_status, wraplength=400, justify="left").pack(anchor="w", padx=10, pady=(4, 0))
+        foot = ttk.Frame(r)
+        foot.pack(fill="x", side="bottom", padx=10, pady=6)
+        ttk.Label(foot, textvariable=self.v_conn, style="Muted.TLabel").pack(side="left")
+        ttk.Button(foot, text="Refresh", command=self.refresh).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(foot, text="Always on top", variable=self.v_top, command=self._on_top).pack(side="right")
+
+        self.root.bind("<Control-Return>", lambda e: (self.generate(), "break")[1])
+        self.root.bind("<Escape>", lambda e: self.stop())
+
+    def _on_mode(self):
+        mode = self.v_mode.get()
+        if mode == "outpaint":
+            self.f_out.pack(fill="x", padx=10, pady=4, before=self.f_adv)
+        else:
+            self.f_out.pack_forget()
+        self.w_denoise.configure(state="disabled" if mode == "txt2img" else "normal")
+        if mode in ("inpaint", "outpaint"):
+            self.v_denoise.set(1.0)  # full denoise inside the mask; lower it to keep more of the original
+        elif mode == "img2img" and self.v_denoise.get() >= 0.99:
+            self.v_denoise.set(0.6)
+
+    def _on_workflow(self):
+        # a custom workflow carries its own model/steps/CFG/sampler – these fields apply to the built-in one only
+        state = "normal" if self.v_workflow.get() == BUILTIN else "disabled"
+        for w in self.recipe_widgets:
+            w.configure(state=state)
+
+    def _on_top(self):
+        self.root.attributes("-topmost", bool(self.v_top.get()))
+
+    # ---------- connections ----------
+
+    def refresh(self):
+        def work():
+            info = {}
+            try:
+                self.pc.close()
+                p = self.pc.ping()
+                info["pc"] = f"PhotoCraft ● ({p['documents']} doc.)"
+            except PhotoCraftError as e:
+                info["pc"] = "PhotoCraft ○"
+                info["err"] = str(e)
+            try:
+                info["ckpts"] = self.comfy.checkpoints()
+                info["samplers"] = self.comfy.samplers()
+                info["scheds"] = self.comfy.schedulers()
+                info["fooocus"] = self.comfy.fooocus_inpaint()
+                info["comfy"] = "ComfyUI ●"
+            except ComfyError as e:
+                info["comfy"] = "ComfyUI ○"
+                info.setdefault("err", str(e))
+            self.events.put(("refresh", info))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_refresh(self, info):
+        self.v_conn.set(f"{info['pc']}   {info['comfy']}")
+        if info.get("ckpts"):
+            self.cb_ckpt["values"] = info["ckpts"]
+            if self.v_ckpt.get() not in info["ckpts"]:
+                self.v_ckpt.set(info["ckpts"][0])
+        if info.get("samplers"):
+            self.cb_sampler["values"] = info["samplers"]
+        if info.get("scheds"):
+            self.cb_sched["values"] = info["scheds"]
+        if "fooocus" in info:
+            ok = info["fooocus"] is not None
+            self.cb_fooocus.configure(state="normal" if ok else "disabled",
+                                      text="Fooocus inpaint (SDXL, as in Krita AI Diffusion)" + ("" if ok else " – not on server"))
+        self.templates = list_templates(self.workflows_dir)
+        self.cb_workflow["values"] = [BUILTIN] + [t.name for t in self.templates]
+        if self.v_workflow.get() not in self.cb_workflow["values"]:
+            self.v_workflow.set(BUILTIN)
+        self._on_workflow()
+        if info.get("err"):
+            self.v_status.set(info["err"])
+
+    # ---------- generation ----------
+
+    def _request(self) -> Request:
+        wf = self.v_workflow.get()
+        wf_path = None if wf == BUILTIN else str(self.workflows_dir / wf)
+        p = GenParams(prompt=self.t_prompt.get("1.0", "end").strip(), negative=self.t_neg.get("1.0", "end").strip(),
+                      checkpoint=self.v_ckpt.get().strip(), steps=int(self.v_steps.get()), cfg=float(self.v_cfg.get()),
+                      sampler=self.v_sampler.get(), scheduler=self.v_scheduler.get(), seed=int(self.v_seed.get()),
+                      denoise=1.0 if self.v_mode.get() == "txt2img" else float(self.v_denoise.get()))
+        return Request(mode=self.v_mode.get(), params=p, workflow=wf_path, base_res=int(self.v_res.get()),
+                       context=float(self.v_context.get()), mask_grow=int(self.v_grow.get()),
+                       mask_blur=int(self.v_blur.get()), outpaint=tuple(int(v.get()) for v in self.v_expand),
+                       overlap=int(self.v_overlap.get()), variants=int(self.v_variants.get()),
+                       fooocus=bool(self.v_fooocus.get()),
+                       layer_mask={v: k for k, v in LAYER_MASKS.items()}.get(self.v_lmask.get(), "soft"))
+
+    def generate(self):
+        if self.worker and self.worker.is_alive():
+            return
+        try:
+            req = self._request()
+        except (tk.TclError, ValueError) as e:
+            self.v_status.set(f"Invalid value: {e}")
+            return
+        self._save_state(req)
+        self.b_go.configure(state="disabled")
+        self.b_stop.configure(state="normal")
+        self.pb.configure(mode="determinate", value=0)
+
+        def progress(f, msg):
+            self.events.put(("progress", (f, msg)))
+
+        def work():
+            try:
+                res = self.bridge.run(req, progress)
+                self.events.put(("done", f"Done ({res['pipeline']}) – seed {res['seed']}, layers: {len(res['layers'])}"))
+            except Cancelled:
+                self.events.put(("done", "Cancelled."))
+            except (BridgeError, ComfyError, PhotoCraftError, ValueError, OSError) as e:
+                self.events.put(("done", f"Error: {e}"))
+            except Exception as e:  # unexpected – show it instead of dying silently
+                self.events.put(("done", f"Unexpected error: {type(e).__name__}: {e}"))
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
+    def stop(self):
+        if self.worker and self.worker.is_alive():
+            self.bridge.cancel()
+            self.v_status.set("Cancelling…")
+
+    def _poll(self):
+        try:
+            while True:
+                kind, data = self.events.get_nowait()
+                if kind == "progress":
+                    f, msg = data
+                    if f < 0:
+                        self.pb.configure(mode="indeterminate")
+                        self.pb.step(0.05)
+                    else:
+                        self.pb.configure(mode="determinate", value=f)
+                    self.v_status.set(msg)
+                elif kind == "done":
+                    self.pb.configure(mode="determinate", value=0)
+                    self.v_status.set(data)
+                    self.b_go.configure(state="normal")
+                    self.b_stop.configure(state="disabled")
+                elif kind == "refresh":
+                    self._apply_refresh(data)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll)
+
+    def _save_state(self, req: Request):
+        p = req.params
+        cfgmod.save_state({
+            "mode": req.mode, "workflow": self.v_workflow.get(), "checkpoint": p.checkpoint, "prompt": p.prompt,
+            "negative": p.negative, "steps": p.steps, "cfg": p.cfg, "denoise": self.v_denoise.get(),
+            "sampler": p.sampler, "scheduler": p.scheduler, "variants": req.variants, "base_res": req.base_res,
+            "context": req.context, "mask_grow": req.mask_grow, "mask_blur": req.mask_blur, "overlap": req.overlap,
+            "expand": list(req.outpaint), "on_top": bool(self.v_top.get()), "fooocus": req.fooocus, "layer_mask": req.layer_mask,
+        })
+
+    def _quit(self):
+        try:
+            self._save_state(self._request())
+        except Exception:
+            pass
+        self.bridge.cancel()
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+def run_gui(cfg: dict) -> int:
+    try:
+        App(cfg).run()
+    except tk.TclError as e:
+        print(f"Can't open the window ({e}). Is the `tk` package installed?")
+        return 1
+    return 0

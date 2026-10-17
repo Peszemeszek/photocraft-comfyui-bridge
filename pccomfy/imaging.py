@@ -1,0 +1,101 @@
+"""Bridge-side image ops: crop with context, scaling, mask preparation, outpaint pre-fill."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+from PIL import Image, ImageFilter
+
+
+@dataclass
+class Box:
+    x: int
+    y: int
+    w: int
+    h: int
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return (self.x + self.w / 2, self.y + self.h / 2)
+
+    def pil(self) -> tuple[int, int, int, int]:
+        return (self.x, self.y, self.x + self.w, self.y + self.h)
+
+
+def mask_bbox(mask: Image.Image, threshold: int = 3) -> Box | None:
+    a = np.asarray(mask.convert("L"))
+    ys, xs = np.nonzero(a > threshold)
+    if len(xs) == 0:
+        return None
+    return Box(int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1))
+
+
+def grow_box(b: Box, canvas: tuple[int, int], context: float, min_px: int = 32) -> Box:
+    """Grow the box by context (fraction of the longer side, at least min_px), clipped to the canvas."""
+    W, H = canvas
+    pad = max(min_px, int(round(context * max(b.w, b.h))))
+    x0, y0 = max(0, b.x - pad), max(0, b.y - pad)
+    x1, y1 = min(W, b.x + b.w + pad), min(H, b.y + b.h + pad)
+    return Box(x0, y0, x1 - x0, y1 - y0)
+
+
+def gen_size(w: int, h: int, base: int, multiple: int = 16, max_upscale: float = 2.0) -> tuple[int, int]:
+    """Generation size with an area of ~base², the crop's aspect ratio, rounded to a multiple of `multiple`."""
+    scale = math.sqrt((base * base) / float(w * h))
+    scale = min(scale, max_upscale)
+    gw = max(multiple, int(round(w * scale / multiple)) * multiple)
+    gh = max(multiple, int(round(h * scale / multiple)) * multiple)
+    return gw, gh
+
+
+def prepare_mask(mask: Image.Image, grow: int, blur: int) -> Image.Image:
+    """Mask for the model: grown and blurred a little so the generation overlaps the edge."""
+    m = mask.convert("L")
+    if grow > 0:
+        m = m.filter(ImageFilter.MaxFilter(grow * 2 + 1))
+    if blur > 0:
+        m = m.filter(ImageFilter.GaussianBlur(blur))
+    return m
+
+
+def fill_transparent(img: Image.Image) -> Image.Image:
+    """Fill transparent pixels with a blurred extension of the edges (pull–push).
+
+    When outpainting, the new canvas area is transparent; this gives the model plausible colours
+    instead of black, which makes the transition much better.
+    """
+    rgba = np.asarray(img.convert("RGBA")).astype(np.float32) / 255.0
+    alpha = rgba[..., 3:4]
+    if alpha.min() > 0.99:
+        return img.convert("RGB")
+    rgb = rgba[..., :3] * alpha
+    out = rgba[..., :3].copy()
+    known = alpha[..., 0] > 0.99
+    h, w = alpha.shape[:2]
+    for radius in (2, 8, 32, 128, 512):
+        if known.all():
+            break
+        small = max(1, int(radius / 2))
+        sw, sh = max(1, w // small), max(1, h // small)
+        # Blur via downscale + Gaussian + upscale (fast for large radii).
+        def blur(arr):
+            im = Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8))
+            im = im.resize((sw, sh), Image.BILINEAR).filter(ImageFilter.GaussianBlur(2)).resize((w, h), Image.BILINEAR)
+            return np.asarray(im).astype(np.float32) / 255.0
+        brgb = blur(rgb)
+        ba = blur(alpha[..., 0])[..., None]
+        fill = (~known) & (ba[..., 0] > 0.02)
+        out[fill] = (brgb / np.maximum(ba, 1e-4))[fill]
+        known = known | fill
+    out[~known] = rgba[..., :3][known].mean(axis=0) if known.any() else 0.5
+    return Image.fromarray((np.clip(out, 0, 1) * 255).astype(np.uint8), "RGB")
+
+
+def to_rgb(img: Image.Image) -> Image.Image:
+    if img.mode == "RGB":
+        return img
+    if img.mode in ("RGBA", "LA") or "transparency" in img.info:
+        return fill_transparent(img)
+    return img.convert("RGB")
